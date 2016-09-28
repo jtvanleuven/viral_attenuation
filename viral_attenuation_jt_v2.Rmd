@@ -27,7 +27,6 @@ This is an R Markdown document. Markdown is a simple formatting syntax for autho
 
 ## testing changes for git
 ## testing more changes in git
-### testing git diff
 
 
 ### ===== Load libraries  ====== 
