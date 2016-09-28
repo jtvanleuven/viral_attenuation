@@ -1,0 +1,1115 @@
+---
+title: "viral_attenuation_jt_v1"
+author: "jt"
+date: "June 8, 2016"
+output: pdf_document
+---
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+#### Required Files: 
+####                 virus genome sequence in *.fasta format
+####                 virus *.gff file
+####                 host genome sequence in *.fasta format
+####                 host *.gff file
+####                 ecoli RSCU values from Sharp et al. 2010 - 10.1098/rstb.2009.0305
+####                 SD affinities from Li 2012
+####                 codon table "genetic_code.txt"
+####                 list of highly expressed genes in bacteria "bacteria_high_genes.txt" from PMC94675
+
+#### Notes:
+####       "Analysis provides data matrices of 3 levels"
+####
+####               codon level - codons: frequencies, and diNT content
+####               codon pair level - codon pairs: frequencies, "r" values from Boycheva2003, iSD counts, restriction site counts, diNT counts
+####               gene level - gene:CPB score, length, seq, cai
+
+
+## testing changes for git
+
+
+### ===== Load libraries  ====== 
+```{r message=FALSE}
+library(parallel)
+library(foreach)
+library(doParallel)
+registerDoParallel(cores=6)
+library(RColorBrewer)
+library(plotrix)
+library(RSQLite)
+library(Biostrings)
+library(Biobase)
+library(seqinr)
+library(data.table)
+library(stringr)
+library(plyr)
+library(dplyr)
+library(lme4)
+library(ggplot2)
+library(Hmisc)
+library(psych)
+data(caitab)
+```
+
+### ===== Open general files - always run  ======  
+```{r}
+
+basepath <- "C:/Users/JT/Dropbox/NIH proposal working/_Attentuation_Code/jts_model"
+#change path here for your computer
+#basepath <- "~/Dropbox/NIH proposal working/_Attentuation_Code/jts_model"
+setwd(basepath)
+
+isdvals <- read.delim(file = paste(basepath, "/hexamer_energy.txt", sep=""), header=FALSE)
+isdvals <- data.frame(isdvals[,-1], row.names=tolower(isdvals[,1]))
+
+caivals <- read.csv(file = paste(basepath, "/sharp_2010_cai.csv", sep=""), header=FALSE) #10.1098/rstb.2009.0305
+caivals <- data.frame(caivals[,-2], row.names=caivals[,2])
+
+codonvals <- read.csv(file = paste(basepath, "/codon_vals.csv", sep=""), row.names=NULL, stringsAsFactors=FALSE)
+codonvals <- codonvals[,-1]
+row.names(codonvals) <- gsub("u","t",tolower(codonvals[,2]))
+codonvals["agg",]$CAI <- 0.0001
+codonvals["cga",]$CAI <- 0.0001
+codonvals <- codonvals[-62,]
+codonvals_org <- codonvals
+
+gencode <- read.csv(file = paste(basepath, "/genetic_code.txt", sep=""), header=FALSE, stringsAsFactors = FALSE)
+gencode <- data.frame(gencode[,-1], row.names=tolower(gencode[,1]))
+gencode[,2] <- data.frame(tolower(gencode[,2]))
+gencode[,4] <- data.frame(tolower(gencode[,4]))
+gencode[,6] <- data.frame(tolower(gencode[,6]))
+gencode[,8] <- data.frame(tolower(gencode[,8]))
+gencode[,10] <- data.frame(tolower(gencode[,10]))
+
+species <- "phix174_jt"              #edit here
+#species <- "phix174_optimized"
+virusseq = read.fasta(file = paste(species, ".fasta", sep=""),seqtype="DNA")[[1]]
+virusgff <- read.delim(file = paste(species, ".gff", sep=""),header=FALSE, comment.char="#")
+virusgffcds <- virusgff[grepl("CDS", virusgff$V3),]
+
+rs_seqs <- read.csv(file = paste(basepath, "/RS_list_full.csv", sep=""), header=FALSE, stringsAsFactors = FALSE)
+rs_seqs <- unique(as.matrix(as.character(rs_seqs[,2])))
+rs_seqs <- cbind(rs_seqs[,1],rs_seqs[,1])
+rs_seqs <- data.frame(rs_seqs[,-1], row.names=tolower(rs_seqs[,1]))
+
+```
+
+### ===== Open files for host (bacterial) genome - always run ====== 
+```{r}
+#open host genome stuff
+host <- "ecoli"              #edit here  ###watch out for extension names
+hostseq = read.fasta(file = paste(host, ".fasta", sep=""),seqtype="DNA")[[1]]
+hostgff <- read.delim(file = paste(host, ".gff", sep=""),header=FALSE, comment.char="#")
+hostgffcds <- hostgff[grepl("CDS", hostgff$V3),]
+#get rid of genes in plasmids
+hostgffcds <- hostgffcds[which(as.character(hostgffcds$V1)==attr(hostseq,"name")),]
+
+#run the analysis on highly expressed bacterial genes !!!!!!!!!!!!!!!!!!!!!!!!!
+#this just makes new hostgffcds file. must run rest of code after you run this
+#commentout to run on entire ecoli genome
+high_exp <- read.delim(file="bacteria_high_genes.txt",header=FALSE)
+df <- hostgffcds
+df$gene <- NA
+for (i in 1:nrow(df)){
+  df$gene[i] <- gene <- str_match(df[i,9], ".*gene=([A-Za-z*]+);.*")[2]
+}
+df <- df[!is.na(df$gene),]
+row.names(df) <- make.names(df$gene, unique=TRUE)
+hostgffcds_high <- matrix(,ncol=9)
+for (i in 1:nrow(high_exp)){
+  hostgffcds_high <- rbind(hostgffcds_high, df[as.character(high_exp[i,1]),1:9])
+}
+hostgffcds_high <- na.omit(hostgffcds_high)
+
+rm(df)
+
+```
+
+### ===== Open files for virus genome - always run ====== 
+```{r}
+
+#open virus genomes stuff
+species <- "phix174_jt"              #edit here
+#species <- "t7"              #edit here
+genomeseq = read.fasta(file = paste(species, ".fasta", sep=""),seqtype="DNA")[[1]]
+gff <- read.delim(file = paste(species, ".gff", sep=""),header=FALSE, comment.char="#")
+gffcds <- gff[grepl("CDS", gff$V3),]
+
+```
+
+
+### ===== calculate stuff on host (bacterial) genome - always run ====== 
+```{r}
+##############get host genome and gene sequences from *.gff + build hexmer matrix
+for (i in 1:nrow(hostgffcds)){
+  length <- (hostgffcds[i,5]-hostgffcds[i,4]+1)/3
+  genename <- str_match(hostgffcds[i,9], ".*ID=([A-Za-z0-9*]+);.*")[,2]
+  genestring <- paste(hostseq[hostgffcds[i,4]:hostgffcds[i,5]],collapse="")
+  geneseq <- DNAString(as.character(genestring))
+  if (as.character(hostgffcds[i,7]) == "-"){
+    geneseq <- reverseComplement(geneseq)
+    genestring <- toString(geneseq)
+  }
+  if(i==1){
+    hostgenesconcat <- genestring
+    hexmercounts <- as.matrix(oligonucleotideFrequency(geneseq,6,step=3))
+  }
+  if(i>1){
+   hostgenesconcat <- paste(hostgenesconcat,genestring,sep="")
+   hexmercounts = hexmercounts + as.matrix(oligonucleotideFrequency(geneseq,6,step=3))
+  }
+}
+
+hostgenesconcat <- DNAString(as.character(hostgenesconcat))
+codonfreq <- as.matrix(trinucleotideFrequency(hostgenesconcat,step=3))
+hexmercounts <- cbind(rownames(hexmercounts),hexmercounts[,1])
+hexmercounts2 <- cbind(rownames(hexmercounts),hexmercounts[,1])
+numhex <- sum(as.numeric(as.character(hexmercounts[,2])))
+hostgenesstring <- paste(hostgenesconcat[1:as.numeric(as.character(length(hostgenesconcat)))],collapse="")
+hoststring = paste(hostseq[1:as.numeric(as.character(length(hostseq)))],collapse="")
+
+#calculate codon frequency within genome and within each aminoacid
+codonfreq2 <- codonfreq
+names <- as.matrix(row.names(codonfreq))
+codonfreq2 <- cbind(tolower(names[,1]),rep(0,nrow(codonfreq)),codonfreq[,1],rep(0,nrow(codonfreq)),rep(0,nrow(codonfreq)))
+
+codonCount <- sum(as.numeric(as.character(codonfreq2[,3])))
+for (i in 1:nrow(codonfreq2)){
+  codonfreq2[i,2] <- gencode[tolower(as.character(codonfreq2[i,1])),1]
+  codonfreq2[i,4] <- as.numeric(as.character(codonfreq2[i,3]))/codonCount
+}
+aminoCount <- as.matrix(aggregate(as.numeric(as.character(codonfreq2[,3]))~as.character(codonfreq2[,2]), data=codonfreq2, sum))
+aminoCount <- data.frame(aminoCount[,-1], row.names=(aminoCount[,1]))
+for (i in 1:nrow(codonfreq2)){
+  codonfreq2[i,5] <- as.numeric(as.character(codonfreq2[i,3]))/as.numeric(as.character(aminoCount[as.character(codonfreq2[i,2]),1]))
+}
+
+#add dinucleotide stuff to codon counts
+codonfreq2 <- cbind(codonfreq2,rep(0,nrow(codonfreq2)))
+codonfreq2 <- cbind(codonfreq2,rep(0,nrow(codonfreq2)))
+for (i in 1:nrow(codonfreq2)){
+    codonfreq2[i,6] <- str_count(as.character(codonfreq2[i,1]), "cg")
+    codonfreq2[i,7] <- caivals[as.character(codonfreq2[i,1]),2]
+}
+colnames(codonfreq2) <- c("codon", "aminoacid", "countingenes", "freqingenes", "freqinaa", "diNT", "RSCU")
+
+#save matrix for analysis down the road (see Lmer stuff and plotting)
+codonfreq_bact<-codonfreq2
+colnames(codonfreq_bact) <- c("codon", "aminoacid", "countingenes", "freqingenes", "freqinaa", "diNT", "RSCU")
+
+########calculate codon pair bias the old way
+df2 <- data.frame(1:nrow(hexmercounts))
+for (i in 1:nrow(hexmercounts)){
+  df <- as.matrix(strsplit(hexmercounts[i,1], "(?<=.{3})",perl=TRUE)[[1]])
+  c1prob <- codonfreq[df[1,1],]/sum(codonfreq[,1])
+  c2prob <- codonfreq[df[2,1],]/sum(codonfreq[,1])
+  df2[i,1] <- hexmercounts[i,1]
+  df2[i,2] <- as.numeric(c1prob*c2prob*numhex)
+  df2[i,3] <- as.numeric(sqrt(numhex*c1prob*c2prob*(1-c1prob*c2prob)))
+  df2[i,4] <- paste(gencode[tolower(as.character(df[1,1])),1],gencode[tolower(as.character(df[2,1])),1],sep="")
+}
+hexmercounts <- cbind(hexmercounts,df2[,2:3])
+hexmercounts[,2] <- as.numeric(as.character(hexmercounts[,2]))
+hexmercounts[,3] <- as.numeric(as.character(hexmercounts[,3]))
+hexmercounts[,5] <- (hexmercounts[,2]-hexmercounts[,3])/as.numeric(hexmercounts[,4])
+hexmercounts <- data.frame(hexmercounts[,-1], row.names=tolower(hexmercounts[,1]))
+hexmercounts <- cbind(hexmercounts,df2[,4])
+colnames(hexmercounts) <- c("freqOBS", "freqEXP", "DEV", "r", "AAseq")  #for calculations see DOI: 10.1093/bioinformatics/btg082
+rm(df,df2,c1prob,c2prob)
+
+########calculate codon pair bias the new way
+df <- hexmercounts
+df <- data.frame(df[,-2])
+df <- data.frame(df[,-2])
+df <- data.frame(df[,-2])
+aminopairCount <- as.matrix(aggregate(as.numeric(as.character(df[,1]))~as.character(df[,2]), data=df, sum))
+aminopairCount <- data.frame(aminopairCount[,-1], row.names=(aminopairCount[,1]))
+df2 <- data.frame(1:nrow(hexmercounts))
+for (i in 1:nrow(hexmercounts)){
+  df <- as.matrix(strsplit(row.names(hexmercounts[i,]), "(?<=.{3})",perl=TRUE)[[1]])
+  #df3 <- rbind(df3,paste(df[1,1], df[2,1]))
+  c1prob <- as.numeric(as.character(codonfreq2[toupper(df[1,1]),5]))
+  c2prob <- as.numeric(as.character(codonfreq2[toupper(df[2,1]),5]))
+  numhex <- as.numeric(as.character(aminopairCount[as.character(hexmercounts[i,5]),1]))
+  df2[i,1] <- hexmercounts[i,1]
+  df2[i,2] <- as.numeric(c1prob*c2prob*numhex)
+  df2[i,3] <- as.numeric(sqrt(numhex*c1prob*c2prob*(1-c1prob*c2prob)))
+  df2[i,4] <- paste(gencode[tolower(as.character(df[1,1])),1],gencode[tolower(as.character(df[2,1])),1],sep="")
+}
+hexmercounts <- cbind(hexmercounts,df2[,2:3])
+hexmercounts[,8] <- (hexmercounts[,1]-hexmercounts[,6])/as.numeric(hexmercounts[,7])
+colnames(hexmercounts) <- c("freqOBS", "freqEXP", "DEV", "r", "AAseq", "freqEXP_winAA", "DEV_winAA", "r_winAA")  #for calculations see DOI: 10.1093/bioinformatics/btg082
+#codon pairs comprised of only W and M have NaN values. need to replace.
+hexmercounts[is.na(hexmercounts)] <-0
+rm(df,df2,c1prob,c2prob)
+
+for(i in 1:nrow(hexmercounts)){
+  #print(isdvals[rownames(hexmercounts[i,]),1])
+  hexmercounts[i,9] <- isdvals[rownames(hexmercounts[i,]),1]
+}
+colnames(hexmercounts) <- c("freqOBS", "freqEXP", "DEV", "r", "AAseq", "freqEXP_winAA", "DEV_winAA", "r_winAA", "isdval")
+
+#go grab the frequency statistics for each isd from the hexmer counts matrix
+isdval_freq <- merge(hexmercounts,isdvals,by=0)
+isdval_freq <- data.frame(isdval_freq[,-1], row.names=tolower(isdval_freq[,1]))
+names(isdval_freq) <- c("freqOBS", "freqEXP", "DEV", "r", "AAseq", "freqEXP_winAA", "DEV_winAA", "r_winAA", "isdval")
+
+#####need to run the code up until here to get hexmercounts matrix built
+
+#find distribution of restriction sites in ecoli genome
+for (i in 1:nrow(rs_seqs)){
+  rs_seqs[i,2] <- sum(str_count(hoststring, tolower(as.character(rs_seqs[i,1]))))
+  rs_seqs[i,3] <- sum(str_count(hostgenesstring, as.character(rs_seqs[i,1])))
+}
+rs_seqs[,4] <- rs_seqs[,2]/sum(rs_seqs[,2])
+rs_seqs[,5] <- rs_seqs[,3]/sum(rs_seqs[,3])
+rs_seqs[,6] <- rs_seqs[,4]/rs_seqs[,5]
+#find overlap of restriction sites and hexmers
+for (i in 1:nrow(hostgffcds)){
+  length <- (hostgffcds[i,5]-hostgffcds[i,4]+1)/3
+  genename <- str_match(hostgffcds[i,9], ".*ID=([A-Za-z0-9*]+);.*")[,2]
+  genestring <- paste(hostseq[hostgffcds[i,4]:hostgffcds[i,5]],collapse="")
+  genestring <- paste("n",genestring,"n",sep="")
+  geneseq <- DNAString(as.character(genestring))
+  if (identical(hostgffcds[i,7],"-")){
+    geneseq <- reverseComplement(geneseq)
+    genestring <- toString(geneseq)
+  }
+  if(i==1){
+    octmercounts <- as.matrix(oligonucleotideFrequency(geneseq,8,step=3))
+  }
+  if(i>1){
+    octmercounts <- octmercounts + as.matrix(oligonucleotideFrequency(geneseq,8,step=3))
+  }
+}
+octmercounts <- cbind(as.matrix(row.names(octmercounts)),octmercounts[,1])
+octmercounts <- octmercounts[which(as.numeric(as.character(octmercounts[,2]))!=0),]
+octmercounts <- cbind(octmercounts,as.matrix(as.character(substr(octmercounts[,1], 2, 7))))
+octmercounts <- cbind(octmercounts,rep(0,nrow(octmercounts)))
+for (i in 1:nrow(octmercounts)){
+  for (j in 1:nrow(rs_seqs)){
+     octmercounts[i,4] <- as.numeric(as.character(octmercounts[i,4])) + as.numeric(as.character(str_count(as.character(octmercounts[i,1]), as.character(rs_seqs[j,1]))))
+  }
+  
+}
+octmercounts <- cbind(octmercounts,rep(0,nrow(octmercounts)))
+octmercounts[,5] <- as.numeric(as.character(octmercounts[,2])) * as.numeric(as.character(octmercounts[,4]))
+colnames(octmercounts) <- c("plus_flanking", "freqingenes", "hexmer", "numResSites", "totingene")
+
+octmercounts2 <- as.matrix(cbind(octmercounts[,3],octmercounts[,5]))
+octmercounts2 <- aggregate(as.numeric(as.character(octmercounts2[,2])) ~ as.character(octmercounts2[,1]), data=octmercounts2, sum)
+octmercounts2 <- data.frame(octmercounts2[,-1], row.names=tolower(octmercounts2[,1]))
+
+done_bact <- merge(isdval_freq,octmercounts2,by=0)
+done_bact <- data.frame(done_bact[,-4])
+done_bact <- data.frame(done_bact[,-7])
+names(done_bact) <- c("hexmer", "freqOBS", "freqEXP", "r", "AAseq", "freqEXP_winAA", "r_winAA", "isdval", "numCutSites")
+
+#add dinucleotide stuff
+########add dinucleotide data to codon pairs
+done_bact <- cbind(done_bact,rep(0,nrow(done_bact)))
+for (i in 1:nrow(done_bact)){
+    done_bact[i,10] <- str_count(done_bact[i,1], "[atgc][atcg]cg[atgc][atgc]")
+}
+
+names(done_bact) <- c("hexmer", "freqOBS", "freqEXP", "r", "AAseq", "freqEXP_winAA", "r_winAA", "isdval", "numCutSites", "diNT")
+#write.csv(done_bact,file="done_bact.csv")
+done_bact <- read.csv("C:/Users/JT/Dropbox/NIH proposal working/_Attentuation_Code/jts_model/done_bact.csv")
+
+#loop through host genome again to calculate per gene cpb
+gene_cp_dist_bac <- data.frame(1:nrow(hostgffcds))
+for (i in 1:nrow(hostgffcds)){
+  genestring <- paste(hostseq[hostgffcds[i,4]:hostgffcds[i,5]],collapse="")
+  geneseq <- DNAString(as.character(genestring))
+  if (identical(as.character(hostgffcds[i,7]),"-")){
+    geneseq <- reverseComplement(geneseq)
+    genestring <- toString(geneseq)
+  }
+  counts <- data.frame(oligonucleotideFrequency(geneseq,6,step=3))
+  mult <- data.frame(hexmercounts$r_winAA)*data.frame(counts[,1])
+  mult <- na.omit(mult)
+  cods <- data.frame(oligonucleotideFrequency(geneseq,3,step=3))
+  row.names(cods) <- tolower(row.names(cods))
+  cods <- merge(cods,codonvals,by=0)
+  mult_sd <- data.frame(hexmercounts$isdval)*data.frame(counts[,1])
+  gene_cp_dist_bac[i,1] <- sum(mult[,1])/sum(counts)
+  gene_cp_dist_bac[i,2] <- length(geneseq)
+  gene_cp_dist_bac[i,3] <- as.character(geneseq)
+  gene_cp_dist_bac[i,4] <- as.character(hostgffcds[i,7])
+  gene_cp_dist_bac[i,5] <- cai(strsplit(genestring,"")[[1]],caitab$ec)
+  if(cai(strsplit(genestring,"")[[1]],caitab$ec) == 0){
+    print(hostgffcds$V9)
+  }
+  gene_cp_dist_bac[i,6] <- prod(cods$CAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2],na.rm = TRUE))  #calculate CAI from Sharps 1987 table
+  gene_cp_dist_bac[i,7] <- prod(cods$ITE.iso^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  gene_cp_dist_bac[i,8] <- prod(cods$sCAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  gene_cp_dist_bac[i,9] <- sum(mult_sd[,1])/length(geneseq)
+  gene_cp_dist_bac[i,10] <- prod(cods$tAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  gene_cp_dist_bac[i,11] <- prod(cods$CAI_Xia2007^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  codonvals <- codonvals_org
+}
+names(gene_cp_dist_bac) <- c("cpb", "length", "gc", "gene", "cai", "cai_jt", "ITE.iso", "sens", "isd", "tAI", "cai_xia")
+
+#loop through host genome (highly expressed genes) again to calculate per gene cpb
+#make sure to pass the reduced gff set (see lines 76-90)
+gene_cp_dist_high <- data.frame(1:nrow(hostgffcds_high))
+for (i in 1:nrow(hostgffcds_high)){
+  genestring <- paste(hostseq[hostgffcds_high[i,4]:hostgffcds_high[i,5]],collapse="")
+  geneseq <- DNAString(as.character(genestring))
+  if (identical(as.character(hostgffcds_high[i,7]),"-")){
+    geneseq <- reverseComplement(geneseq)
+    genestring <- toString(geneseq)
+  }
+  counts <- data.frame(oligonucleotideFrequency(geneseq,6,step=3))
+  mult <- data.frame(hexmercounts$r_winAA)*data.frame(counts[,1])
+  mult <- na.omit(mult)
+  cods <- data.frame(oligonucleotideFrequency(geneseq,3,step=3))
+  row.names(cods) <- tolower(row.names(cods))
+  cods <- merge(cods,codonvals,by=0)
+  mult_sd <- data.frame(hexmercounts$isdval)*data.frame(counts[,1])
+  mult_sd[is.na(mult_sd)] <- 0
+  gene_cp_dist_high[i,1] <- sum(mult[,1])/sum(counts)
+  gene_cp_dist_high[i,2] <- length(geneseq)
+  gene_cp_dist_high[i,3] <- as.character(geneseq)
+  gene_cp_dist_high[i,4] <- as.character(hostgffcds[i,7])
+  gene_cp_dist_high[i,5] <- cai(strsplit(genestring,"")[[1]],caitab$ec)
+  gene_cp_dist_high[i,6] <- prod(cods$CAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))  #calculate CAI from Sharps 1987 table
+  gene_cp_dist_high[i,7] <- prod(cods$ITE.iso^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  gene_cp_dist_high[i,8] <- prod(cods$sCAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  gene_cp_dist_high[i,9] <- sum(mult_sd[,1])/length(geneseq)
+  gene_cp_dist_high[i,10] <- prod(cods$tAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  gene_cp_dist_high[i,11] <- prod(cods$CAI_Xia2007^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+  codonvals <- codonvals_org
+}
+names(gene_cp_dist_high) <- c("cpb", "length", "gc", "gene", "cai", "cai_jt", "ITE.iso", "sens", "isd", "tAI", "cai_xia")
+
+require(gridExtra)
+done_gene_dist_all <- subset(gene_cp_dist_bac,select=c(length,cpb,cai_jt,cai_xia,ITE.iso,tAI))
+done_gene_dist_all$type <- rep("all",nrow(done_gene_dist_all))
+done_gene_dist_high <- subset(gene_cp_dist_high,select=c(length,cpb,cai_jt,cai_xia,ITE.iso,tAI))
+done_gene_dist_high$type <- rep("high",nrow(done_gene_dist_high))
+done_gene_dist <- rbind(done_gene_dist_high,done_gene_dist_all)
+cpb <- ggplot(done_gene_dist,aes(x=cpb, fill=type)) + geom_histogram(binwidth = 0.3)+ scale_fill_manual(values=c("grey45","magenta4"))
+cai_jt <- ggplot(done_gene_dist,aes(x=cai_jt, fill=type)) + geom_histogram(binwidth = 0.01)+ scale_fill_manual(values=c("grey45","magenta4"))
+cia_xia <- ggplot(done_gene_dist,aes(x=cai_xia, fill=type)) + geom_histogram(binwidth = 0.01)+ scale_fill_manual(values=c("grey45","magenta4"))
+ITE.iso <- ggplot(done_gene_dist,aes(x=ITE.iso, fill=type)) + geom_histogram(binwidth = 0.01)+ scale_fill_manual(values=c("grey45","magenta4"))
+grid.arrange(cpb,cai_jt,cia_xia,ITE.iso,nrow=4)
+
+```
+
+
+### ===== Calculate stuff for viral genome + general matrices - always run  ====== 
+```{r}
+#all data gets put into df "master"
+for (i in 1:nrow(virusgffcds)){
+  length <- (virusgffcds[i,5]-virusgffcds[i,4]+1)/3
+  genename <- str_match(virusgffcds[i,9], ".*ID=([A-Za-z*]+);.*")[,2]
+  genestring <- paste(virusseq[virusgffcds[i,4]:virusgffcds[i,5]],collapse="")
+  geneseq <- DNAString(as.character(genestring))
+  if (identical(virusgffcds[i,7],"-")){
+    geneseq <- reverseComplement(geneseq)
+    genestring <- toString(geneseq)
+    df <- data.frame(seq(virusgffcds[i,5],virusgffcds[i,4],by=3))
+  }else{
+    df <- data.frame(seq(virusgffcds[i,4],virusgffcds[i,5],by=3))
+  }
+  codons <- as.matrix(substring(genestring, seq(1,nchar(genestring),3), seq(3,nchar(genestring),3)))
+  gene <- matrix(genename,nrow=length(codons))
+  frame <- matrix(virusgffcds[i,7],nrow=length(codons))
+  df <- cbind(gene,codons,df,frame)
+  if(i==1){
+    master1 <- cbind(data.frame(seq(1,length)),df)
+    hexmercounts_virus <- as.matrix(oligonucleotideFrequency(geneseq,6,step=3))
+  }
+  if(i>1){
+   dt <- cbind(data.frame(seq(1,length)),df)
+   master1 <- rbind(master1,dt)
+   hexmercounts_virus = hexmercounts_virus + as.matrix(oligonucleotideFrequency(geneseq,6,step=3))
+  }
+}
+names(master1) <- c("AApos", "gene", "codon", "viruspos", "frame")
+rm(gene)
+
+for (i in 1:nrow(master1)){
+  codon <- as.character(master1[i,3])
+  master1[i,6] <- sum(str_count(codon, "[gc]"))/3
+  master1[i,7] <- codonvals[as.character(master1[i,3]),]$CAI
+  master1[i,8] <- codonvals[as.character(master1[i,3]),]$ITE.iso
+  master1[i,9] <- codonvals[as.character(master1[i,3]),]$sCAI
+}
+names(master1) <- c("AApos", "gene", "codon", "viruspos", "frame", "gc", "CAI", "ITE.iso", "sens")
+
+#loop through viral genome again to calculate per gene cpb
+gene_cp_dist_virus <- data.frame(1:nrow(gffcds))
+virusseqs <- vector("list",nrow(gffcds))
+for (i in 1:nrow(gffcds)){
+  genename <- str_match(gffcds[i,9], ".*ID=([A-Za-z0-9*]+);.*")[,2]
+  genestring <- paste(genomeseq[gffcds[i,4]:gffcds[i,5]],collapse="")
+  virusseqs[[i]] <- genestring
+  geneseq <- DNAString(as.character(genestring))
+  if (identical(gffcds[i,7],"-")){
+    geneseq <- reverseComplement(geneseq)
+    genestring <- toString(geneseq)
+  }
+  counts <- data.frame(oligonucleotideFrequency(geneseq,6,step=3))
+  mult <- data.frame(hexmercounts$r_winAA)*data.frame(counts[,1])
+  mult[is.na(mult)] <- 0
+  gene_cp_dist_virus[i,1] <- sum(mult[,1])/sum(counts[,1])
+  gene_cp_dist_virus[i,2] <- length(geneseq)
+  gene_cp_dist_virus[i,3] <- as.character(geneseq)
+  gene_cp_dist_virus[i,4] <- as.character(gffcds[i,7])
+  gene_cp_dist_virus[i,5] <- cai(strsplit(genestring,"")[[1]],caitab$ec)
+  gene_cp_dist_virus[i,6] <- geometric.mean(master1[which(master1$gene==genename),]$CAI, na.rm=TRUE)
+  gene_cp_dist_virus[i,7] <- geometric.mean(master1[which(master1$gene==genename),]$ITE.iso)
+  gene_cp_dist_virus[i,8] <- geometric.mean(master1[which(master1$gene==genename),]$sens)
+  gene_cp_dist_virus[i,9] <- genename
+}
+names(gene_cp_dist_virus) <- c("cpb", "length", "seq", "frame", "cai", "cai_jt", "ITE.iso", "sens", "gene")
+
+require(gridExtra)
+done_gene_dist_all <- subset(gene_cp_dist_bac,select=c(length,cpb,cai_jt,cai_xia,ITE.iso,tAI))
+done_gene_dist_all$type <- rep("all",nrow(done_gene_dist_all))
+done_gene_dist_high <- subset(gene_cp_dist_high,select=c(length,cpb,cai_jt,cai_xia,ITE.iso,tAI))
+done_gene_dist_high$type <- rep("high",nrow(done_gene_dist_high))
+done_gene_dist <- rbind(done_gene_dist_high,done_gene_dist_all)
+
+cai_jt <- ggplot(done_gene_dist,aes(x=cai_jt, fill=type)) + geom_histogram(binwidth = 0.01)+ scale_fill_manual(values=c("grey45","magenta4")) + labs(x="")
+cai_dot <- ggplot(gene_cp_dist_virus, aes(x=cai)) + geom_dotplot(binwidth = 0.015) + scale_y_continuous(name ="", breaks=NULL) + scale_x_continuous(limits = c(0,0.875)) + theme(plot.margin = unit(c(1,2.4,3,1), "cm"))
+grid.arrange(cai_jt,cai_dot,nrow=2)
+
+cpb <- ggplot(done_gene_dist,aes(x=cpb, fill=type)) + geom_histogram(binwidth = 0.3)+ scale_fill_manual(values=c("grey45","magenta4")) + labs(x="")
+cpb_dot <- ggplot(gene_cp_dist_virus, aes(x=cpb)) + geom_dotplot(binwidth = 0.4) + scale_y_continuous(name ="", breaks=NULL) + scale_x_continuous(limits = c(-2.5,17.5)) + theme(plot.margin = unit(c(1,2.4,3,1), "cm"))
+grid.arrange(cpb,cpb_dot,nrow=2)
+
+# cia_xia <- ggplot(done_gene_dist,aes(x=cai_xia, fill=type)) + geom_histogram(binwidth = 0.01)+ scale_fill_manual(values=c("grey45","magenta4")) + labs(x="")
+# cai_xia_dot <- ggplot(gene_cp_dist_virus, aes(x=cai)) + geom_dotplot(binwidth = 0.015) + scale_y_continuous(name ="", breaks=NULL) + scale_x_continuous(limits = c(0,0.875)) + theme(plot.margin = unit(c(1,2.4,3,1), "cm"))
+# grid.arrange(cai_xia,cai_xia_dot,nrow=2)
+
+ITE.iso <- ggplot(done_gene_dist,aes(x=ITE.iso, fill=type)) + geom_histogram(binwidth = 0.005)+ scale_fill_manual(values=c("grey45","magenta4")) + scale_x_continuous(limits = c(0.5,1))
+ite_dot <- ggplot(gene_cp_dist_virus, aes(x=ITE.iso)) + geom_dotplot(binwidth = 0.009) + scale_y_continuous(name ="", breaks=NULL) + scale_x_continuous(limits = c(0.5,1)) + theme(plot.margin = unit(c(1,2.4,3,1), "cm"))
+grid.arrange(ITE.iso,ite_dot,nrow=2)
+
+```
+
+### ===== Build synonymous mutation space ====== 
+```{r}
+
+#build synonymous codon matrices
+master2 <- master1
+master3 <- master1
+master4 <- master1
+master5 <- master1
+master6 <- master1
+
+masterlst <- list(master1=master1, master2=master2, master3=master3, master4=master4, master5=master5, master6=master6)
+
+#change codons according the the genetic code in the file "gencode.txt"
+for (i in 1:nrow(master1)){
+  masterlst[[2]][i,3] <- as.character(gencode[as.character(master1[i,3]),2])
+  masterlst[[3]][i,3] <- as.character(gencode[as.character(master1[i,3]),4])
+  masterlst[[4]][i,3] <- as.character(gencode[as.character(master1[i,3]),6])
+  masterlst[[5]][i,3] <- as.character(gencode[as.character(master1[i,3]),8])
+  masterlst[[6]][i,3] <- as.character(gencode[as.character(master1[i,3]),10])
+}
+
+#add GC content and CAI values
+for (i in 1:length(masterlst)){
+  for (j in 1:nrow(masterlst[[i]])){
+    masterlst[[i]][j,]$gc <- sum(str_count(as.character(masterlst[[i]][j,3]), "[gcGC]"))/3
+    masterlst[[i]][j,]$CAI <- codonvals[as.character(masterlst[[i]][j,3]),]$CAI
+    masterlst[[i]][j,]$ITE.iso <- codonvals[as.character(masterlst[[i]][j,3]),]$ITE.iso
+    masterlst[[i]][j,]$sens <- codonvals[as.character(masterlst[[i]][j,3]),]$tRNA.sensitivity
+  }
+}
+
+#add shine-delgarno and codonpair values
+for (i in 1:length(masterlst)){
+  for (j in 1:nrow(virusgffcds)){
+    genename <- str_match(virusgffcds[j,9], ".*ID=([A-Za-z*]+);.*")[,2]
+    #need to grab subset of master1 to avoid calculating values across gene boundries
+    df <- masterlst[[i]][which(masterlst[[i]]$gene==genename),]
+    dfmast <- masterlst[[1]][which(masterlst[[1]]$gene==genename),]
+    for (k in 1:nrow(df)){
+      if(k==1){
+        #kinda tricky. all the codons in masterlst2-6 are changed. need to get the WT codons flanking the one we are testing by calling out masterlst[[1]]
+        hex <- paste(as.character(df[k,]$codon),as.character(dfmast[k+1,]$codon),sep="")
+        df[k,10] <- NA
+        df[k,11] <- isdvals[hex,1]
+        df[k,12] <- NA
+        df[k,13] <- hexmercounts[hex,8]
+      }
+      if(k>1 & k<nrow(df)){
+        hex1 <- paste(as.character(dfmast[k-1,3]),as.character(df[k,3]),sep="")
+        hex2 <- paste(as.character(df[k,3]),as.character(dfmast[k+1,3]),sep="")
+        df[k,10] <- isdvals[hex1,1]
+        df[k,11] <- isdvals[hex2,1]
+        df[k,12] <- hexmercounts[hex1,8]
+        df[k,13] <- hexmercounts[hex2,8]
+      }
+      if(k==nrow(df)){
+        hex <- paste(as.character(dfmast[k-1,3]),as.character(df[k,3]),sep="")
+        df[k,10] <- isdvals[hex,1]
+        df[k,11] <- NA
+        df[k,12] <- hexmercounts[hex,8]
+        df[k,13] <- NA
+      }
+    }
+    if(j==1){
+      df2 <- df
+    }
+    if(j>1){
+      df2 <- rbind(df2,df)
+    }
+  }
+  masterlst[[i]] <- df2
+  names(masterlst[[i]]) <- c("AApos", "gene", "codon", "viruspos", "strand", "GC", "RSCU", "ITE.iso", "sens", "frameiSD_1", "frameiSD_2", "codon_pair_1", "codon_pair_2")
+  #masterlst[[i]][,1:3] <- as.character(masterlst[[i]][,1:3])
+}
+master1 <- masterlst[[1]]
+master2 <- masterlst[[2]]
+master3 <- masterlst[[3]]
+master4 <- masterlst[[4]]
+master5 <- masterlst[[5]]
+master6 <- masterlst[[6]]
+
+# delta1 = (masterlst[[2]] - masterlst[[1]])
+# delta2 = (masterlst[[3]] - masterlst[[1]])
+# delta3 = (masterlst[[4]] - masterlst[[1]])
+# delta4 = (masterlst[[5]] - masterlst[[1]])
+# delta5 = (masterlst[[6]] - masterlst[[1]])
+delta1 = masterlst[[1]]
+delta2 = masterlst[[1]]
+delta3 = masterlst[[1]]
+delta4 = masterlst[[1]]
+delta5 = masterlst[[1]]
+
+deltalst <- list(delta1=delta1, delta2=delta2, delta3=delta3, delta4=delta4, delta5=delta5)
+
+for (i in 1:length(deltalst)){
+  deltalst[[i]][,1] <- masterlst[[1]][,1]
+  deltalst[[i]][,2] <- masterlst[[1]][,2]
+  deltalst[[i]][,3] <- paste(masterlst[[1]][,3],masterlst[[i+1]][,3],sep="->")
+  deltalst[[i]][,4] <- masterlst[[1]][,4]
+  deltalst[[i]][,5] <- masterlst[[1]][,5]
+  deltalst[[i]][,6:12] <- masterlst[[i+1]][,6:12]-masterlst[[1]][,6:12]
+}
+
+delta1 <- cbind(deltalst[[1]],rep(1,nrow(delta1)))
+names(delta1)[14]="delta"
+delta2 <- cbind(deltalst[[2]],rep(2,nrow(delta2)))
+names(delta2)[14]="delta"
+delta3 <- cbind(deltalst[[3]],rep(3,nrow(delta3)))
+names(delta3)[14]="delta"
+delta4 <- cbind(deltalst[[4]],rep(4,nrow(delta4)))
+names(delta4)[14]="delta"
+delta5 <- cbind(deltalst[[5]],rep(5,nrow(delta5)))
+names(delta5)[14]="delta"
+
+deltaall <- rbind(delta1,delta2,delta3,delta4,delta5)
+masterall <- rbind(master1,master2,master3,master4,master5,master6)
+
+###gotta fix overlapping genes
+for (i in 1:nrow(deltaall)){
+  if(deltaall[i,4]>1907 & deltaall[i,4]<2250){
+    deltaall[i,6:11] <- NA
+  }
+  if(deltaall[i,4]>1094 & deltaall[i,4]<1797){
+    deltaall[i,6:11] <- NA
+  }
+  if(deltaall[i,2]=="A*"){
+    deltaall[i,6:11] <- NA
+  }
+}
+deltaall[deltaall == "NA"] = NA
+
+for (i in 1:nrow(master1)){
+  if(master1[i,4]>1907 & master1[i,4]<2250){
+    master1[i,6:11] <- NA
+  }
+  if(master1[i,4]>1094 & master1[i,4]<1797){
+    master1[i,6:11] <- NA
+  }
+  if(master1[i,2]=="A*"){
+    master1[i,6:11] <- NA
+  }
+}
+master1[master1 == "NA"] = NA
+master1 <- na.omit(master1)
+deltaall[deltaall == "NA"] = NA
+deltaall <- na.omit(deltaall)
+
+```
+
+### ===== random analyses - probably can't run as a block ====== 
+```{r}
+plot(x=isdval_freq$r,y=isdval_freq$isdval)
+done_human_plot <- cbind(done_human$diNT+2, done_human$r_winAA)
+done_bact_plot <- cbind(done_bact$diNT, done_bact$r_winAA)
+done_plot<-as.matrix(rbind(done_bact_plot,done_human_plot))
+colnames(done_plot) <- c("diNT", "r_winAA")
+
+#The within-AA frequency of a codon appears to be affected by CpG in humans, but not in E. coli.
+codonfreq_bact <- data.frame(codonfreq_bact)
+codonfreq_bact$RSCU <- as.numeric(as.character(codonfreq_bact$RSCU))
+codonfreq_bact$diNt <- as.numeric(as.character(codonfreq_bact$diNT))
+codonfreq_bact$freqinaa <- as.numeric(as.character(codonfreq_bact$freqinaa))
+par(mfrow=c(1,2))
+par(mai=c(0.4,0.4,0.4,0.4))
+plot(codonfreq_bact$diNT,codonfreq_bact$freqinaa, main="E.coli")
+mtext("Within AA codon frequency", side=2, at=0.5, outer = F)
+par(mai=c(0.4,0.4,0.4,0.4))
+plot(codonfreq_human$diNT,codonfreq_human$freqinaa, main="Human")
+mtext("Number of CpG in codon", side=1, at=0.2, outer = F)
+
+
+library(piecewiseSEM)
+lmer.null <- lmer(formula=r_winAA ~ (1|AAseq), data=done_bact)
+lmer.diNT <- lmer(formula=r_winAA ~ diNT + (1|AAseq), data=done_bact)
+lmer.SD <- lmer(formula=r_winAA ~ isdval + (1|AAseq), data=done_bact)    # family=beta
+lmer.RS <- lmer(formula=r_winAA ~ numCutSites + (1|AAseq), data=done_bact)
+lmer.SD.RS <- lmer(formula=r_winAA ~ isdval + numCutSites + (1|AAseq), data=done_bact)
+lmer.null2 <- lmer(formula=freqinaa ~ (1|aminoacid), data=codonfreq_bact)
+lmer.rscu <- lmer(formula=freqinaa ~ diNT + (1|aminoacid), data=codonfreq_bact)
+sem.model.fits(list(lmer.diNT, lmer.SD, lmer.RS, lmer.SD.RS, lmer.null))
+sem.model.fits(list(lmer.rscu, lmer.null2))
+
+lmer2.null <- lmer(formula=r_winAA ~ (1|AAseq), data=done_human)
+lmer2.diNT <- lmer(formula=r_winAA ~ diNT + (1|AAseq), data=done_human)
+lmer2.SD <- lmer(formula=r_winAA ~ isdval + (1|AAseq), data=done_human)    # family=beta
+lmer2.RS <- lmer(formula=r_winAA ~ numCutSites + (1|AAseq), data=done_human)
+lmer2.SD.RS <- lmer(formula=r_winAA ~ isdval + numCutSites + (1|AAseq), data=done_human)
+lmer2.null2 <- lmer(formula=freqinaa ~ (1|aminoacid), data=codonfreq_human)
+lmer2.rscu <- lmer(formula=freqinaa ~ diNT + (1|aminoacid), data=codonfreq_human)
+sem.model.fits(list(lmer2.diNT, lmer2.SD, lmer2.RS, lmer2.SD.RS, lmer2.null))
+sem.model.fits(list(lmer2.rscu, lmer2.null2))
+
+
+  r2.corr.mer <- function(m) {
+    lmfit <-  lm(model.response(model.frame(m)) ~ fitted(m))
+    summary(lmfit)$r.squared
+  }
+
+  r2.corr.mer(lmer.rscu)
+  
+
+#work on analyzing gene G (or any other gene)
+
+gene <- "G"
+masterallg <- masterall[which(masterall$gene==gene),]
+masterallg <- masterallg[!is.na(masterallg$codon),]
+master1g <- master1[which(master1$gene==gene),]
+master1g <- master1g[!is.na(master1g$codon),]
+deltaallg <- deltaall[which(deltaall$gene==gene),]
+deltaallg <- deltaallg[!is.na(deltaallg$RSCU),]
+#get rid of the first 37 bases and stop codons
+masterallg <- masterallg[which(masterallg$AApos > 12),]
+master1g <- master1g[which(master1g$AApos > 12),]
+deltaallg <- deltaallg[which(deltaallg$AApos > 12),]
+summary(masterallg)
+numseqs <- data.frame(table(masterallg$AApos))
+prod(numseqs$Freq)   #prints out the total number of synoymous sequences that exist for this gene (synoymous sequence space)
+
+df <- deltaallg
+df[df == 0] <- NA
+rscu_min <- as.numeric(as.character(quantile(df$RSCU,na.rm=TRUE)[2]))
+rscu_max <- as.numeric(as.character(quantile(df$RSCU,na.rm=TRUE)[4]))
+ITE_min <- as.numeric(as.character(quantile(df$ITE.iso,na.rm=TRUE)[2]))
+ITE_max <- as.numeric(as.character(quantile(df$ITE.iso,na.rm=TRUE)[4]))
+sens_min <- as.numeric(as.character(quantile(df$sens,na.rm=TRUE)[2]))
+sens_max <- as.numeric(as.character(quantile(df$sens,na.rm=TRUE)[4]))
+isd_min <- as.numeric(as.character(quantile((df$frameiSD_1+df$frameiSD_2),na.rm=TRUE)[2]))
+isd_max <- as.numeric(as.character(quantile((df$frameiSD_1+df$frameiSD_2),na.rm=TRUE)[4]))
+cp_min <- as.numeric(as.character(quantile((df$codon_pair_1+df$codon_pair_2),na.rm=TRUE)[2]))
+cp_max <- as.numeric(as.character(quantile((df$codon_pair_1+df$codon_pair_2),na.rm=TRUE)[4]))
+
+#many sites are sensitive to have reduced values because they have high values in WT
+#therefore there may be more than one syn codon change that results in a large change
+#this section goes through and picks the codon with maximal change
+min_rscu <- deltaallg[which(deltaallg$RSCU < rscu_min | deltaallg$RSCU > rscu_max) ,]
+cnts <- data.frame(table(min_rscu$AApos))
+for (i in 1:nrow(cnts)){
+  if (cnts[i,2] > 1){
+    max_list <- min_rscu[which(min_rscu$AApos==cnts[i,1]),]
+    min_rscu[which(min_rscu$AApos==cnts[i,1]),] <- max_list[which(max_list$RSCU==min(max_list$RSCU)),]
+  }
+}
+min_rscu <- min_rscu %>% distinct
+
+min_ITE <- deltaallg[which(deltaallg$ITE.iso < ITE_min | deltaallg$ITE.iso > ITE_max),]
+cnts <- data.frame(table(min_ITE$AApos))
+for (i in 1:nrow(cnts)){
+  if (cnts[i,2] > 1){
+    max_list <- min_ITE[which(min_ITE$AApos==cnts[i,1]),]
+    min_ITE[which(min_ITE$AApos==cnts[i,1]),] <- max_list[which(max_list$ITE.iso==min(max_list$ITE.iso)),]
+  }
+}
+min_ITE <- min_ITE %>% distinct
+
+max_sens <- deltaallg[which(deltaallg$sens > sens_max | deltaallg$sens < sens_min),]
+cnts <- data.frame(table(max_sens$AApos))
+for (i in 1:nrow(cnts)){
+  if (cnts[i,2] > 1){
+    max_list <- max_sens[which(max_sens$AApos==cnts[i,1]),]
+    max_sens[which(max_sens$AApos==cnts[i,1]),] <- max_list[which(max_list$sens==max(max_list$sens)),]
+  }
+}
+max_sens <- max_sens %>% distinct
+
+min_isd <- deltaallg[which((deltaallg$frameiSD_1+deltaallg$frameiSD_2) < isd_min | (deltaallg$frameiSD_1+deltaallg$frameiSD_2) > isd_max),]
+cnts <- data.frame(table(min_isd$AApos))
+for (i in 1:nrow(cnts)){
+  if (cnts[i,2] > 1){
+    max_list <- min_isd[which(min_isd$AApos==cnts[i,1]),]
+    min_isd[which(min_isd$AApos==cnts[i,1]),] <- max_list[which((max_list$frameiSD_1+max_list$frameiSD_2)==min((max_list$frameiSD_1+max_list$frameiSD_2),na.rm=TRUE)),]
+  }
+}
+min_isd <- min_isd %>% distinct
+
+min_cp <- deltaallg[which((deltaallg$codon_pair_1+deltaallg$codon_pair_2) < cp_min),]# | (deltaallg$codon_pair_1+deltaallg$codon_pair_2) > cp_max),]
+cnts <- data.frame(table(min_cp$AApos))
+for (i in 1:nrow(cnts)){
+  if (cnts[i,2] > 1){
+    max_list <- min_cp[which(min_cp$AApos==cnts[i,1]),]
+    min_cp[which(min_cp$AApos==cnts[i,1]),] <- max_list[which((max_list$codon_pair_1+max_list$codon_pair_2)==min((max_list$codon_pair_1+max_list$codon_pair_2),na.rm=TRUE)),]
+  }
+}
+min_cp <- min_cp %>% distinct
+rm(max_list)
+
+deltaallg_max <- rbind(min_rscu,min_ITE,max_sens,min_isd,min_cp)
+deltaallg_max<- deltaallg_max %>% distinct
+numseqs_max <- data.frame(table(deltaallg_max$AApos))
+prod(numseqs_max$Freq)  #total number of sequences if we allow all max_change sites to vary
+
+#build constructs that include all max_changes for each characteristic
+master1g <- master1[which(master1$gene==gene),]
+master1g <- master1g[!is.na(master1g$codon),]
+master1g$codon <- as.character(master1g$codon)
+rscu_construct <- vector("list",nrow(master1g))
+for(i in 1:length(rscu_construct)){
+  rand <- sample(1:100, 1) #get a random number to replace high impact site with WT once and a while
+  if(length(min_cp[which(min_cp$AApos==i),]$AApos) > 0 & rand > 0){  #length allows you to avoid logic(0) issue as it returns a 0 or 1
+    rscu_construct[[i]] <- gsub(".*->", "",min_cp[which(min_cp$AApos==i),]$codon)
+  }else if(length(deltaallg_max[which(deltaallg_max$AApos==i),]$AApos) > 0 & rand > 0) {
+    rscu_construct[[i]] <- gsub(".*->", "",deltaallg_max[which(deltaallg_max$AApos==i),]$codon)
+  }else{
+    rscu_construct[[i]] <- master1g[which(master1g$AApos==i),]$codon
+  }
+}
+for(i in 1:length(rscu_construct)){
+  numseqs_max[i,2] <- length(rscu_construct[[i]])
+}
+prod(numseqs_max$Freq)
+
+rscu_construct <- lapply(rscu_construct, function(x) unname(x))
+rscu_constructs <- transpose(expand.grid(rscu_construct,stringsAsFactors = FALSE))
+gene_cp_dist_library <- data.frame(1:length(rscu_constructs))
+
+#############################################chunk of code that imports multifasta and calculates all the values
+calc.vals <- function(genestring,gene){
+      row <- data.frame(matrix(NA, nrow = 1, ncol = 9))
+      geneseq <- DNAString(as.character(genestring))
+      counts <- data.frame(oligonucleotideFrequency(geneseq,6,step=3))
+      mult <- data.frame(hexmercounts$r_winAA)*data.frame(counts[,1])
+      mult[is.na(mult)] <- 0
+      mult_sd <- data.frame(hexmercounts$isdval)*data.frame(counts[,1])
+      mult_sd[is.na(mult_sd)] <- 0
+      cods <- data.frame(oligonucleotideFrequency(geneseq,3,step=3))
+      row.names(cods) <- tolower(row.names(cods))
+      cods <- merge(cods,codonvals,by=0)
+      row[1,1] <- sum(mult[,1])/sum(counts[,1])
+      row[1,2] <- length(geneseq)
+      row[1,3] <- str_count(genestring, "[gc]")/length(geneseq)
+      row[1,4] <- gene
+      row[1,5] <- cai(strsplit(genestring,"")[[1]],caitab$ec)
+      row[1,6] <- prod(cods$CAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))  #calculate CAI from Sharps 1987 table
+      row[1,7] <- prod(cods$ITE.iso^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+      row[1,8] <- prod(cods$sCAI^cods[,2],na.rm=TRUE)^(1/sum(cods[,2]))
+      row[1,9] <- sum(mult_sd[,1])/length(geneseq)
+      return(row)}#end function
+input.fasta <- read.fasta(file="mod_seqs.fa")
+vals <- data.frame(matrix(nrow = 1, ncol = 9))
+vals = foreach(i = 1:length(input.fasta),.combine = rbind, .packages=c('Biostrings','stringr','seqinr')) %dopar% {
+  seq <- paste(input.fasta[[i]][1:length(input.fasta[[i]])],collapse="")
+  gene <- getAnnot(input.fasta[[i]])
+  calc.vals(seq,gene)
+}
+names(vals) <- c("cpb", "length", "gc", "gene", "cai", "cai_jt", "ITE.iso", "sens", "isd")
+
+#############################################chunk of code that imports multifasta and calculates all the values
+
+
+```
+
+
+```{r, eval=TRUE}
+#load up a different fasta sequence to analyze
+# virusseq = read.fasta(file = "test_seq.fasta",seqtype="DNA")[[1]]
+# genestring <- paste(virusseq[1:513],collapse="")
+# genestring <- tolower(genestring)
+# geneseq <- DNAString(as.character(genestring))
+# codons <- as.matrix(substring(genestring, seq(1,nchar(genestring),3), seq(3,nchar(genestring),3)))
+# G.seq<-codons
+
+#iterative function to deoptimize genes
+    gencode2 <- cbind(anc=rownames(gencode), gencode[,seq(2,10, by=2)])
+    gencode2 <- as.data.frame(apply(gencode2, 2, function(x) as.character(x)),stringsAsFactors=FALSE)
+    
+    deopt.CPB.local <- function(cur.seq, X, criteria, cutoffs){
+      len <- length(cur.seq)
+      # set up vectors or data frame that holds best mutant sequence and the scores for it
+      vals.pos.cods <- as.data.frame(matrix(nrow=len, ncol=3+X))
+      colnames(vals.pos.cods) <- c("dCPB", "dSD", "dRSCU", paste("cod", seq(1,X), sep="."))
+   
+      for (i in 2:(len-X)){
+        #print(i)
+        pos.seq.ls <- vector("list",X)
+        codons.iX <- as.character(cur.seq[i:(i+X-1)])
+        cods.raw <- lapply(codons.iX, function(x) as.character(gencode2[which(gencode2[,1]==x),]))
+        cods.clean <- lapply(cods.raw, function(x) x[which(x!="")])
+        cods.clean <- lapply(cods.clean, function(x) unname(x))
+        pos.cods <- expand.grid(cods.clean)
+        pos.cods <- as.data.frame(apply(pos.cods, 2, function(x) as.character(x)), stringsAsFactors=FALSE)
+        
+        l <- length(pos.cods[,1])
+        pos.cods.2 <- as.data.frame(cbind(left=rep(as.character(cur.seq[i-1]),l),pos.cods,right=rep(as.character(cur.seq[i+X]),l)), stringsAsFactors=FALSE)
+        pos.cods.2 <- as.data.frame(apply(pos.cods.2, 2, function(x) as.character(x)), stringsAsFactors=FALSE)
+        
+        # --- get  CPS, iSD and RSCU for each mutant sequence (row in pos.cods.2)---
+        CPBv.by.pos <- t(apply(pos.cods.2, 1, function(x)  sapply(seq(1,length(x)-1), function(y) hexmercounts[paste(x[c(y:(y+1))], collapse=""),]$r_winAA)))
+        iSDv.by.pos <- t(apply(pos.cods.2, 1, function(x)  sapply(seq(1,length(x)-1), function(y) isdvals[paste(x[c(y:(y+1))], collapse=""),1])))
+        RSCUv.by.pos <- t(apply(pos.cods.2, 1, function(x)  sapply(x, function(y) caivals[y,2])))
+        
+        CPB.by.pos <- rowMeans(CPBv.by.pos)
+        iSD.by.pos <- rowMeans(iSDv.by.pos)
+        #probably don't need to include the flanking codons in the mean for RSCU
+        RSCU.by.pos <- rowMeans(RSCUv.by.pos[,2:(X+1)])
+        
+        dCPB <- CPB.by.pos - CPB.by.pos[1]
+        dSD <- iSD.by.pos - iSD.by.pos[1]
+        dRSCU <- RSCU.by.pos - RSCU.by.pos[1]
+        
+        deltas <- list(CPB=dCPB, SD=dSD, RSCU=dRSCU)
+        
+        crit.dex <- which(names(deltas)==criteria)
+        not.crit <- seq(1,3)
+        not.crit <- not.crit[-crit.dex]
+        
+        filtered <- lapply(not.crit, function(x) which(deltas[[x]] > cutoffs[[x]][1] &  deltas[[x]] < cutoffs[[x]][2]))
+        filt.2 <- intersect(filtered[[1]], filtered[[2]])
+        
+        best.dex <- filt.2[which.min(deltas[[crit.dex]][filt.2])]
+        #best.dex <- filt.2[which.max(deltas[[crit.dex]][filt.2])]
+        vals.pos.cods[i,1:3] <- unlist(lapply(seq(1,3), function(x) deltas[[x]][best.dex]))
+        vals.pos.cods[i,4:(3+X)] <- as.character(pos.cods[best.dex,])
+      
+        # run results through the seleciton filter and identiy best change.
+        # put the best change in vals.pos.cods (in row i)
+      }
+      best.change <- which.min(vals.pos.cods[,crit.dex])
+      #best.change <- which.max(vals.pos.cods[,crit.dex])
+      mut.seq <- cur.seq
+      mut.seq[best.change:(best.change+X-1)] <- unlist(vals.pos.cods[best.change, 4:(4+X-1)])
+          
+      return(mut.seq)
+    }
+
+    
+  calc.3.scores <- function(seq.to.eval){
+    CPS <- sapply(seq(1,length(seq.to.eval)-1), function(y) hexmercounts[paste(seq.to.eval[c(y:(y+1))], collapse=""),]$r_winAA)
+    SDS <- sapply(seq(1,length(seq.to.eval)-1), function(x) isdvals[paste(seq.to.eval[c(x:(x+1))], collapse=""),1])
+    RSCU <- sapply(seq(1,length(seq.to.eval)-1), function(z) caivals[seq.to.eval[z],2])
+    CAI <- mean(RSCU,na.rm=TRUE)
+    SD <- mean(SDS,na.rm=TRUE)
+    CPB <- mean(CPS,na.rm=TRUE)
+    return(list(CPS=CPS, CPB=CPB, SD=SD, CAI=CAI))
+  }
+ 
+  
+#start running analysis here 
+  G.seq<- as.character(master1$codon[which(master1$gene=="J")])
+  #cutoffs <- list(CPB=c(-4.563,5.014), SD=c(-1.7,0.4), RSCU=c(-1.59, 0.62))  # revisit this. Probably need to narrow.
+  cutoffs <- list(CPB=c(-100,100), SD=c(-100,100), RSCU=c(-100, 100))
+  scores <- calc.3.scores(G.seq)
+  CPB.org <- scores$CPB
+  num.ints <- 20
+  graph.change <- matrix(ncol = 4, nrow = num.ints)
+  colnames(graph.change) <- c("interation","CPB","SD","CAI")
+  mut.seq <- G.seq
+#restart loop here
+  for (k in 1:num.ints){
+    mut.seq <- deopt.CPB.local(mut.seq, X=2, criteria="CPB", cutoffs) #CPB, RSCU, SD
+    print(calc.3.scores(mut.seq)$CPB)
+    print(calc.3.scores(mut.seq)$SD)
+    print(calc.3.scores(mut.seq)$CAI)
+    graph.change[k,1] <- k
+    graph.change[k,2] <- calc.3.scores(mut.seq)$CPB
+    graph.change[k,3] <- calc.3.scores(mut.seq)$SD
+    graph.change[k,4] <- calc.3.scores(mut.seq)$CAI
+  }
+  # need to calculate CPB of original sequence and each recursion so we know when to stop.
+
+    graph2<-rbind(cbind(graph.change[,1],graph.change[,2],rep("CPB",num.ints)),cbind(graph.change[,1],graph.change[,3],rep("SD",num.ints)),cbind(graph.change[,1],graph.change[,4],rep("CAI",num.ints)))
+  colnames(graph2) <- c("interation","val","type")
+  graph2 <- data.frame(graph2)
+  graph2$type <- as.character(graph2$type)
+  graph2$val <- as.numeric(as.character(graph2$val))
+  graph2$interation <- as.numeric(as.character(graph2$interation))
+  ggplot(graph2, aes(x=interation, y=val)) + geom_line() + facet_grid(type ~ .)
+  
+```
+
+
+### ===== Print out data  ====== 
+```{r, echo=FALSE}
+#interpret data
+#set up so that delta values are new minus old
+#binding affinities are opposite as published larger values mean stonger binder
+#CAI: positive delta value = more adaptive
+#GC: positive delta value = more GCs
+#SD: positive delta value = stronger binder
+
+#histogram of RSCU values colored by gene
+ggplot(master1, aes(x=RSCU, fill=gene)) + geom_histogram(binwidth = 0.2) + scale_fill_brewer(palette="Spectral")
+#histogram of delta RSCU values colored by gene
+ggplot(deltaall, aes(x=RSCU, fill=gene)) + geom_histogram(binwidth = 0.2) + scale_fill_brewer(palette="Spectral")
+#histogram of cpb values colored by gene
+ggplot(master1, aes(x=codon_pair_2, fill=gene)) + geom_histogram(binwidth = 2.5) + scale_fill_brewer(palette="Spectral")
+#histogram of delta cpb values colored by gene
+deltacpb <- deltaall
+ggplot(deltaall, aes(x=deltaall$codon_pair_1+deltaall$codon_pair_2, fill=gene)) + geom_histogram(binwidth = 5) + scale_fill_brewer(palette="Spectral")
+#histogram of iSD values colored by gene
+ggplot(master1, aes(x=frameiSD_2, fill=gene)) + geom_histogram(binwidth = 0.5) + scale_fill_brewer(palette="Spectral")
+#histogram of iSD values colored by gene
+ggplot(deltaall, aes(x=frameiSD_1+frameiSD_2, fill=gene)) + geom_histogram(binwidth = 0.5) + scale_fill_brewer(palette="Spectral") + ylim(0,200)
+
+rscu <- as.matrix(as.numeric(as.character(na.omit(deltaall$RSCU))))
+colnames(rscu) <- "values"
+describe(rscu)
+sd1 <- as.matrix(as.numeric(as.character(na.omit(deltaall$frameiSD_1))))
+colnames(sd1) <- "values"
+describe(sd1)
+sd2 <- as.matrix(as.numeric(as.character(na.omit(deltaall$frameiSD_2))))
+colnames(sd2) <- "values"
+describe(sd2)
+
+sd_all <- data.frame(rbind(cbind(as.character(deltaall[,2]),as.numeric(as.character(deltaall[,8]))),cbind(as.character(deltaall[,2]),as.numeric(as.character(deltaall[,9])))))
+colnames(sd_all) <- c("gene", "sd_aff")
+#describe(sd_all)
+sd_all[sd_all == 0] <- NA
+sd_all <- na.omit(sd_all)
+describe(as.numeric(as.character(sd_all$sd_aff)))
+sd_all_df <- data.table(sd_all)
+
+cp_all <- data.frame(rbind(cbind(as.character(deltaall[,2]),as.numeric(as.character(deltaall[,10]))),cbind(as.character(deltaall[,2]),as.numeric(as.character(deltaall[,11])))))
+colnames(cp_all) <- c("gene", "cp_pref")
+cp_all[cp_all == 0] <- NA
+cp_all <- na.omit(cp_all)
+cp_all_df <- data.table(cp_all)
+
+
+cp1 <- as.matrix(as.numeric(as.character(na.omit(deltaall$codon_pair_1))))
+colnames(cp1) <- "values"
+describe(cp1)
+cp2 <- as.matrix(as.numeric(as.character(na.omit(deltaall$codon_pair_2))))
+colnames(cp2) <- "values"
+describe(cp2)
+
+#large effect SDs
+#max_iSD <- deltaall[which(deltaall[ ,8] > 1.3 | deltaall[ ,9] > 3.0 | deltaall[ ,8] < -0.4 | deltaall[ ,9] < -1.9), ]
+max_iSD <- deltaall
+#drop NAs
+max_iSD <- max_iSD[which(max_iSD$frameiSD_1 != "NA" | max_iSD$frameiSD_2 != "NA"), ]
+#small effect on other parameters
+max_iSD <- max_iSD[which(abs(as.numeric(as.character(max_iSD$GC))) < .34 & max_iSD$RSCU > -0.02 & max_iSD$RSCU < 0.16 & max_iSD$codon_pair_1 < 5.012 & max_iSD$codon_pair_1 > -15.17 & max_iSD$codon_pair_2 < 5.012 & max_iSD$codon_pair_2 > -15.17), ]
+#maximaize change in sd values (sum of sd1 and sd2)
+max_iSD <- max_iSD[which(as.numeric(as.character(max_cp$frameiSD_1))+as.numeric(as.character(max_cp$frameiSD_2)) < 0), ]
+
+sd_max <- data.frame(rbind(cbind(as.character(max_iSD[,2]),as.numeric(as.character(max_iSD[,8]))),cbind(as.character(max_iSD[,2]),as.numeric(as.character(max_iSD[,9])))))
+colnames(sd_max) <- c("gene", "sd_aff")
+sd_max[sd_max == 0] <- NA
+sd_max <- na.omit(sd_max)
+sd_max <- data.table(sd_max)
+
+max_cp <- deltaall
+max_cp <- max_cp[which(max_cp[ ,10] != "NA" | max_cp[ ,11] != "NA"), ]
+#small effect on other parameters
+max_cp <- max_cp[which(abs(as.numeric(as.character(max_cp$GC))) < .34 & max_cp$RSCU > -1.59 & max_cp$RSCU < 0.62 & max_cp$frameiSD_1 < 0.4 & max_cp$frameiSD_1 > -1.7 & max_cp$frameiSD_2 < 0.4 & max_cp$frameiSD_2 > -1.7), ]
+
+max_cp <- max_cp[which(abs(as.numeric(as.character(max_cp$GC))) < .34 & max_cp$frameiSD_1 < 1.7 & max_cp$frameiSD_1 > -0.4 & max_cp$frameiSD_2 < 1.7 & max_cp$frameiSD_2 > -0.4), ]
+#add iSDs after minimize CPB
+#max_cp <- max_cp[which(abs(as.numeric(as.character(max_cp$GC))) < .34 & max_cp$RSCU > -0.02 & max_cp$RSCU < 0.16), ]
+#maximize change in cp values (sum of cp1 and cp2)
+max_cp <- max_cp[which(as.numeric(as.character(max_cp$codon_pair_1))+as.numeric(as.character(max_cp$codon_pair_2)) < 0), ]
+#add iSDs after minimize CPB
+max_cp <- max_cp[which(as.numeric(as.character(max_cp$codon_pair_1))+as.numeric(as.character(max_cp$codon_pair_2)) < 0 & as.numeric(as.character(max_cp$frameiSD_1))+as.numeric(as.character(max_cp$frameiSD_2)) < 0), ]
+
+cp_max <- data.frame(rbind(cbind(as.character(max_cp[,2]),as.numeric(as.character(max_cp[,10]))),cbind(as.character(max_cp[,2]),as.numeric(as.character(max_cp[,11])))))
+colnames(cp_max) <- c("gene", "cp_pref")
+cp_max[cp_max == 0] <- NA
+cp_max <- na.omit(cp_max)
+cp_max <- data.table(cp_max)
+
+
+#maximize change to codon bias
+max_cai <- deltaall
+max_cai <- max_cai[which(max_cai$RSCU != "NA"), ]
+#small effect on other parameters
+max_cai <- max_cai[which(abs(as.numeric(as.character(max_cai$GC))) < .34 & max_cai$codon_pair_1 > -4.563 & max_cai$codon_pair_1 < 5.014 & max_cai$codon_pair_2 > -4.563 & max_cai$codon_pair_2 < 5.014 & max_cai$frameiSD_1 < 0.4 & max_cai$frameiSD_1 > -1.7 & max_cai$frameiSD_2 < 0.4 & max_cai$frameiSD_2 > -1.7), ]
+max_cai <- max_cai[which(as.numeric(as.character(max_cai$RSCU)) < 0), ]
+
+
+
+#print (master1[1:10,])
+#print (master2[1:10,])
+#print (master3[1:10,])
+```
+
+### ===== Plot data  ====== 
+```{r, echo=FALSE}
+
+#count up possible mutation sites
+ggplot(sd_all_df, aes(x=as.numeric(as.character(sd_aff)), fill=gene)) + geom_histogram(bins=50)
+ggplot(sd_all_df, aes(x=as.numeric(as.character(sd_aff)))) + geom_histogram(bins=50) + facet_grid(gene ~ .) + labs(x = "Change in SD available")
+
+ggplot(deltaall, aes(x=codon_pair_1+codon_pair_2)) + geom_histogram(bins=50) + facet_grid(gene ~ .) + labs(x = "Change in cP preference available")
+
+ggplot(sd_max, aes(x=as.numeric(as.character(sd_aff)))) + geom_histogram(bins=50) + facet_grid(gene ~ .) + labs(x = "Change in SD available")
+
+ggplot(cp_max, aes(x=as.numeric(as.character(cp_pref)))) + geom_histogram(bins=50) + facet_grid(gene ~ .) + labs(x = "Change in cP preference available")
+
+ggplot(deltaall, aes(x=viruspos, y=RSCU, group=delta)) + geom_point(alpha = 0.25)
+ggplot(deltaall, aes(x=viruspos, y=codon_pair_1, group=delta)) + geom_point(alpha = 0.25)
+#ggplot(deltaall, aes(x=RSCU, y=GC, group=delta)) + geom_point()
+ggplot(deltaall, aes(x=RSCU, y=codon_pair_1+codon_pair_2)) + geom_point(alpha = 0.25)
+ggplot(master1, aes(x=RSCU, y=codon_pair_1)) + geom_point(alpha = 0.25)
+ggplot(master1, aes(x=RSCU, y=codon_pair_2)) + geom_point(alpha = 0.25)
+ggplot(deltaall, aes(x=RSCU, y=codon_pair_2, group=delta)) + geom_point(alpha = 0.25)
+ggplot(deltaall, aes(x=frameiSD_1, y=codon_pair_1, group=delta)) + geom_point(alpha = 0.25)
+ggplot(deltaall, aes(x=frameiSD_2, y=codon_pair_2, group=delta)) + geom_point(alpha = 0.25)
+ggplot(deltaall, aes(x=codon_pair_1, y=codon_pair_2, group=delta)) + geom_point(alpha = 0.25)
+ggplot(deltaall, aes(x=frameiSD_1, y=frameiSD_2, group=delta)) + geom_point(alpha = 0.25)
+
+hist(rscu,breaks=50,prob=TRUE)
+lines(density(rscu,adjust=10))
+
+d <- rbind(cp1,cp2)
+hist(d,breaks=50,prob=TRUE)
+lines(density(d,adjust=5))
+
+d2 <- rbind(sd1,sd2)
+hist(d2,breaks=50,prob=TRUE)
+lines(density(d2,adjust=5))
+
+par(mfrow=c(3,3))
+plot(codon_usage_master$w,codon_usage_master$RSCU)
+plot(codon_usage_master$w,codon_usage_master$ITE.iso)
+plot(codon_usage_master$RSCU,codon_usage_master$ITE.iso)
+plot(codon_usage_master$w,codon_usage_master$Si)
+plot(codon_usage_master$RSCU,codon_usage_master$Si)
+plot(codon_usage_master$w,codon_usage_master$tRNA.sensitivity)
+plot(codon_usage_master$RSCU,codon_usage_master$tRNA.sensitivity)
+plot(codon_usage_master$ITE.iso,codon_usage_master$Si)
+plot(codon_usage_master$ITE.iso,codon_usage_master$tRNA.sensitivity)
+
+```
