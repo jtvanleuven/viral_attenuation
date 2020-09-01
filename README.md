@@ -1,4 +1,4 @@
-# Viral attenduation of phiX174 bacteriophage
+# Viral attenuation of phiX174 bacteriophage
 
 To investigate how codon choice and mRNA folding stability affect viral fitness, we built phiX viruses with altered codon preference and mRNA folding stability characteristics.
 
