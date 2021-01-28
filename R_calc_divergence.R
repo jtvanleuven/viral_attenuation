@@ -1,5 +1,4 @@
 ###load phix sequences to calculate distance between variants
-###used data in processing3 figure 
 
 library(sangerseqR)
 library(stringr)
@@ -20,15 +19,6 @@ View(snp.tbl)
 #need to rearrange so that position 1 is start of A (3981)  offset by 1407
 snp.tbl.fix <- rbind(snp.tbl[3981:nrow(snp.tbl),],snp.tbl[1:3980,])
 #write.csv(snp.tbl.fix, file="phiX_attenuation_snps.csv",row.names = F)
-
-# qstart <- start(subject(pa))  #subject start alignment ##these are revcomp
-# qend <- end(subject(pa)) #subject end alignment ##these are revcomp
-# rstart <- start(pattern(pa))
-# rend <- end(pattern(pa)
-# primarycod <- subseq(reverseComplement(primarySeq(hetcalls[[i]])),get-indels+refindels,get+2-indels+refindels)
-# secondarycod <- subseq(reverseComplement(secondarySeq(hetcalls[[i]])),get-indels+refindels,get+2-indels+refindels)
-# tmp <- indel(pa)
-
 
 ####need to create table 20 rows. cells contain number of codons changed for each amino acid
 genes_orig <- readDNAStringSet("data/all.fasta")   ##old sequences from GBE paper
